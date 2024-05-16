@@ -1,4 +1,4 @@
 # WhoIsThere
 
-Packet sniffer & simple statistis.
+Packet sniffer & simple statistics. See `whoisthere --help` for options.
 

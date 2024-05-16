@@ -16,9 +16,9 @@ use pnet::packet::ethernet::{EthernetPacket, EtherTypes};
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::ipv6::Ipv6Packet;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 
-use rouille::{Request, Response};
+use rouille::Response;
 
 use std::sync::{Mutex, Arc, MutexGuard};
 
@@ -28,9 +28,15 @@ struct WitOpt {
     #[structopt(short, long, help = "Network interface whoisthere is sniffing from")]
     interface: String,
 
-    #[structopt(short, long, help = "Statistics http server bind address & port", default_value = "127.0.0.1:3648")]
+    #[structopt(
+        short,
+        long,
+        help = "Statistics http server bind address & port",
+        default_value = "127.0.0.1:3648"
+    )]
     bind: String,
 }
+
 fn main() {
     let opt = WitOpt::from_args();
     let db = Arc::new(Mutex::new(Stats::new()));
@@ -141,8 +147,6 @@ impl Display for Stats {
             .try_fold((), |_, result| result)
     }
 }
-
-type Db = Arc<Mutex<Stats>>;
 
 fn proc_packet(packet: &[u8]) -> Option<(StatsKey, u128)> {
     if let Some(eth_packet) = EthernetPacket::new(packet) {
