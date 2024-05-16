@@ -7,7 +7,14 @@ publish = false
 license = "BSD-3"
 
 [dependencies]
-structopt = "0.3"
 pnet = "0.34"
-# WHY RUST WHY NO EITHER WHY WHY WHY???
+
+structopt = "0.3"
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+rouille = "3.6.2"
+
+# WHY RUST WHY NO EITHER<L, R> WHY WHY WHY???
 either = "1.11"

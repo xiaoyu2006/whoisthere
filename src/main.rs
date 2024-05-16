@@ -3,9 +3,11 @@ extern crate pnet;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::ops::Deref;
+use std::thread;
 
 use structopt::StructOpt;
-use either::{Either, Left, Right};
+use either::Either;
 
 use pnet::datalink;
 use pnet::datalink::Channel::Ethernet;
@@ -14,52 +16,71 @@ use pnet::packet::ethernet::{EthernetPacket, EtherTypes};
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::ipv6::Ipv6Packet;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use rouille::{Request, Response};
+
 use std::sync::{Mutex, Arc, MutexGuard};
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "whoisthere")]
 struct WitOpt {
-    #[structopt(short, long)]
+    #[structopt(short, long, help = "Network interface whoisthere is sniffing from")]
     interface: String,
-}
 
+    #[structopt(short, long, help = "Statistics http server bind address & port", default_value = "127.0.0.1:3648")]
+    bind: String,
+}
 fn main() {
     let opt = WitOpt::from_args();
-
-    let interfaces = datalink::interfaces();
-    let interface = interfaces
-        .iter().find(|iface| iface.name == opt.interface)
-        .expect("No interfaces found");
-
-    let (_tx, mut rx) = match datalink::channel(interface, Default::default()) {
-        Ok(Ethernet(tx, rx)) => (tx, rx),
-        Ok(_) => panic!("Unknown channel type: Only Ethernet is supported"),
-        Err(e) => panic!("Error creating channel: {}", e)
-    };
-
     let db = Arc::new(Mutex::new(Stats::new()));
 
-    println!("Capturing packets on interface: {}", interface.name);
-    loop {
-        match rx.next() {
-            Ok(packet) => {
-                if let Some(p) = proc_packet(packet) {
-                    update_db(Arc::clone(&db).lock().unwrap(), p);
-                    println!("{}\n", Arc::clone(&db).lock().unwrap());
+    let capdb = db.clone();
+    let capture_thread = thread::spawn(move || {
+        let interfaces = datalink::interfaces();
+        let interface = interfaces
+            .iter().find(|iface| iface.name == opt.interface)
+            .expect("No interfaces found");
+
+        let (_tx, mut rx) = match datalink::channel(interface, Default::default()) {
+            Ok(Ethernet(tx, rx)) => (tx, rx),
+            Ok(_) => panic!("Unknown channel type: Only Ethernet is supported"),
+            Err(e) => panic!("Error creating channel: {}", e)
+        };
+
+        eprintln!("Capturing packets on interface: {}", interface.name);
+        loop {
+            match rx.next() {
+                Ok(packet) => {
+                    if let Some(p) = proc_packet(packet) {
+                        update_db(Arc::clone(&capdb).lock().unwrap(), p);
+                    }
                 }
+                Err(e) => eprintln!("Error receiving packet: {}", e)
             }
-            Err(e) => eprintln!("Error receiving packet: {}", e)
         }
-    }
+    });
+
+    let httpdb = db.clone();
+    let http_thread = thread::spawn(move || {
+        eprintln!("HTTP server @ {}", opt.bind);
+        rouille::start_server(opt.bind, move |request| {
+            eprintln!("Request from {:?}", request);
+            Response::json(Arc::clone(&httpdb).lock().unwrap().deref())
+        });
+    });
+
+    capture_thread.join().unwrap();
+    http_thread.join().unwrap();
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct Ipv4StatsKey {
     pub source: Ipv4Addr,
     pub dest: Ipv4Addr,
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct Ipv6StatsKey {
     pub source: Ipv6Addr,
     pub dest: Ipv6Addr,
@@ -69,12 +90,21 @@ struct Ipv6StatsKey {
 #[derive(PartialEq, Eq, Hash)]
 struct StatsKey(Either<Ipv4StatsKey, Ipv6StatsKey>);
 
+impl Serialize for StatsKey {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+        where S: Serializer {
+        serializer.serialize_str(&format!("{}", self))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 struct StatsValue {
     pub total_length: u128,
     pub total_count: u128,
 }
 
 // Stupid E0117
+#[derive(Serialize)]
 struct Stats(HashMap<StatsKey, StatsValue>);
 
 impl Stats {
@@ -92,8 +122,8 @@ impl StatsValue {
 impl Display for StatsKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match &self.0 {
-            Left(v4) => write!(f, "{} -> {}", v4.source, v4.dest),
-            Right(v6) => write!(f, "{} -> {}", v6.source, v6.dest)
+            Either::Left(v4) => write!(f, "{} -> {}", v4.source, v4.dest),
+            Either::Right(v6) => write!(f, "{} -> {}", v6.source, v6.dest)
         }
     }
 }
@@ -119,7 +149,7 @@ fn proc_packet(packet: &[u8]) -> Option<(StatsKey, u128)> {
         match eth_packet.get_ethertype() {
             EtherTypes::Ipv4 =>
                 if let Some(p) = Ipv4Packet::new(eth_packet.payload()) {
-                    Some((StatsKey(Left(Ipv4StatsKey { source: p.get_source(), dest: p.get_destination() })),
+                    Some((StatsKey(Either::Left(Ipv4StatsKey { source: p.get_source(), dest: p.get_destination() })),
                           p.get_total_length() as u128))
                 } else {
                     eprintln!("Fail to construct Ipv4Packet: packet too small");
@@ -128,7 +158,7 @@ fn proc_packet(packet: &[u8]) -> Option<(StatsKey, u128)> {
             // No, the fact is they are different fundamentally so no polymorphism here sorry
             EtherTypes::Ipv6 =>
                 if let Some(p) = Ipv6Packet::new(eth_packet.payload()) {
-                    Some((StatsKey(Right(Ipv6StatsKey { source: p.get_source(), dest: p.get_destination() })),
+                    Some((StatsKey(Either::Right(Ipv6StatsKey { source: p.get_source(), dest: p.get_destination() })),
                           p.get_payload_length() as u128))
                 } else {
                     eprintln!("Fail to construct Ipv6Packet: packet too small");
