@@ -1,0 +1,13 @@
+[package]
+name = "whoisthere"
+version = "0.0.1"
+edition = "2021"
+authors = ["Yi Cao <me@ycao.top>"]
+publish = false
+license = "BSD-3"
+
+[dependencies]
+structopt = "0.3"
+pnet = "0.34"
+# WHY RUST WHY NO EITHER WHY WHY WHY???
+either = "1.11"
