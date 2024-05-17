@@ -1,10 +1,11 @@
+mod data;
+
 extern crate pnet;
 
-use std::collections::HashMap;
-use std::fmt::{Display, Formatter};
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::Deref;
-use std::thread;
+use std::{panic, process, thread};
+use std::fs;
+use std::path::PathBuf;
 
 use structopt::StructOpt;
 use either::Either;
@@ -16,11 +17,12 @@ use pnet::packet::ethernet::{EthernetPacket, EtherTypes};
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::ipv6::Ipv6Packet;
 
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Serialize, Serializer};
 
 use rouille::Response;
 
-use std::sync::{Mutex, Arc, MutexGuard};
+use std::sync::{Mutex, Arc};
+use crate::data::{Ipv4StatsKey, Ipv6StatsKey, Stats, StatsKey, update_db};
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "whoisthere")]
@@ -35,11 +37,62 @@ struct WitOpt {
         default_value = "127.0.0.1:3648"
     )]
     bind: String,
+
+    #[structopt(
+        short,
+        long,
+        help = "Database file path, default to in-memory database",
+        parse(from_os_str),
+    )]
+    db: Option<PathBuf>,
+}
+
+fn read_db(path: &Option<PathBuf>) -> Stats {
+    if let Some(p) = path {
+        match fs::read_to_string(p) {
+            Ok(s) => serde_json::from_str(&s).unwrap(),
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    // Create empty json
+                    fs::File::create(p).unwrap();
+                    Stats::new()
+                } else {
+                    panic!("Fail to read database: {}", e);
+                }
+            }
+        }
+    } else {
+        Stats::new()
+    }
+}
+
+fn save_db(path: &Option<PathBuf>, in_memory: &Stats) {
+    if let Some(p) = path {
+        match serde_json::to_string(in_memory) {
+            Ok(s) => match fs::write(p, s) {
+                Ok(_) => (),
+                Err(e) => {
+                    panic!("Fail to write database: {}", e);
+                }
+            },
+            Err(e) => {
+                panic!("Fail to serialize database: {}", e);
+            }
+        }
+    }
 }
 
 fn main() {
     let opt = WitOpt::from_args();
-    let db = Arc::new(Mutex::new(Stats::new()));
+    let db = Arc::new(Mutex::new(read_db(&opt.db)));
+
+    // https://stackoverflow.com/questions/35988775/how-can-i-cause-a-panic-on-a-thread-to-immediately-end-the-main-thread
+    let orig_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |panic_info| {
+        // invoke the default handler and exit the process
+        orig_hook(panic_info);
+        process::exit(1);
+    }));
 
     let capdb = db.clone();
     let capture_thread = thread::spawn(move || {
@@ -59,7 +112,8 @@ fn main() {
             match rx.next() {
                 Ok(packet) => {
                     if let Some(p) = proc_packet(packet) {
-                        update_db(Arc::clone(&capdb).lock().unwrap(), p);
+                        update_db(capdb.lock().unwrap(), p);
+                        save_db(&opt.db, capdb.lock().unwrap().deref());
                     }
                 }
                 Err(e) => eprintln!("Error receiving packet: {}", e)
@@ -71,81 +125,13 @@ fn main() {
     let http_thread = thread::spawn(move || {
         eprintln!("HTTP server @ {}", opt.bind);
         rouille::start_server(opt.bind, move |request| {
-            eprintln!("Request from {:?}", request);
-            Response::json(Arc::clone(&httpdb).lock().unwrap().deref())
+            eprintln!("{:?}", request);
+            Response::json(httpdb.lock().unwrap().deref())
         });
     });
 
     capture_thread.join().unwrap();
     http_thread.join().unwrap();
-}
-
-#[derive(PartialEq, Eq, Hash, Serialize, Deserialize)]
-struct Ipv4StatsKey {
-    pub source: Ipv4Addr,
-    pub dest: Ipv4Addr,
-}
-
-#[derive(PartialEq, Eq, Hash, Serialize, Deserialize)]
-struct Ipv6StatsKey {
-    pub source: Ipv6Addr,
-    pub dest: Ipv6Addr,
-}
-
-// E0117 was in my way so workaround ╮( ╯_╰)╭
-#[derive(PartialEq, Eq, Hash)]
-struct StatsKey(Either<Ipv4StatsKey, Ipv6StatsKey>);
-
-impl Serialize for StatsKey {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-        where S: Serializer {
-        serializer.serialize_str(&format!("{}", self))
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct StatsValue {
-    pub total_length: u128,
-    pub total_count: u128,
-}
-
-// Stupid E0117
-#[derive(Serialize)]
-struct Stats(HashMap<StatsKey, StatsValue>);
-
-impl Stats {
-    fn new() -> Self {
-        Stats(HashMap::new())
-    }
-}
-
-impl StatsValue {
-    fn new() -> Self {
-        StatsValue { total_length: 0, total_count: 0 }
-    }
-}
-
-impl Display for StatsKey {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match &self.0 {
-            Either::Left(v4) => write!(f, "{} -> {}", v4.source, v4.dest),
-            Either::Right(v6) => write!(f, "{} -> {}", v6.source, v6.dest)
-        }
-    }
-}
-
-impl Display for StatsValue {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "count : {} size : {}", self.total_count, self.total_length)
-    }
-}
-
-impl Display for Stats {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        self.0.iter()
-            .map(|(k, v)| writeln!(f, "{} --- {}", k, v))
-            .try_fold((), |_, result| result)
-    }
 }
 
 fn proc_packet(packet: &[u8]) -> Option<(StatsKey, u128)> {
@@ -177,11 +163,4 @@ fn proc_packet(packet: &[u8]) -> Option<(StatsKey, u128)> {
         eprintln!("Fail to construct EthernetPacket: packet too small");
         None
     }
-}
-
-fn update_db(mut unlocked_db: MutexGuard<Stats>, stats: (StatsKey, u128)) {
-    let unlocked_db = &mut unlocked_db.0;
-    let entry = unlocked_db.entry(stats.0).or_insert(StatsValue::new());
-    entry.total_count += 1;
-    entry.total_length += stats.1;
 }
